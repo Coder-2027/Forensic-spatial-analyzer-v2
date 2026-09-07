@@ -1,0 +1,31 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Photogrammetry input photos
+input/images/
+
+# Generated reconstruction output
+output/
+
+# OpenMVS / COLMAP generated files
+*.dmap
+*.mvs
+*.ply
+*.log
+
+# Node
+node_modules/
+**/node_modules/
+
+# Frontend build
+frontend/dist/
+
+# IDE
+.vscode/
+.idea/
