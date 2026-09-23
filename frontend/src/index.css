@@ -392,6 +392,8 @@ html, body, #root {
 .viewer-canvas {
   flex: 1;
   position: relative;
+  overflow: hidden;  /* prevents compass / Html labels from bleeding outside */
+  min-height: 0;
 }
 
 /* ── Empty / Placeholder State ─────────────────────────────────────── */
@@ -463,3 +465,354 @@ html, body, #root {
   pointer-events: none;
   z-index: 0;
 }
+
+/* ── Section label ─────────────────────────────────────────────────── */
+.section-label {
+  font-size: 9px;
+  letter-spacing: 1.4px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+}
+
+/* ── Reference Image Upload ────────────────────────────────────────── */
+.ref-upload-row {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+}
+
+.ref-zone {
+  width: 68px;
+  height: 68px;
+  min-width: 68px;
+  border: 1.5px dashed var(--border-light);
+  border-radius: 9px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s;
+  overflow: hidden;
+  background: rgba(13,14,19,0.5);
+}
+
+.ref-zone:hover,
+.ref-zone.drag-over { border-color: var(--accent); background: var(--accent-dim); }
+.ref-zone.has-file  { border-color: var(--success); border-style: solid; }
+
+.ref-zone-hint {
+  font-size: 9px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.ref-preview-thumb {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 7px;
+}
+
+/* ── Direction Select ──────────────────────────────────────────────── */
+.dir-select-wrap {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.dir-select-label {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.dir-select {
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--border-light);
+  background: #0d0e14;
+  color: var(--text-bright);
+  font-size: 13px;
+  font-weight: 600;
+  font-family: 'Inter', system-ui, sans-serif;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.dir-select:focus { border-color: var(--accent); }
+
+.dir-compass-icon {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.dir-icon-svg {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+}
+
+.dir-angle-hint {
+  font-size: 10px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.ref-info-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 8px;
+  padding: 5px 8px;
+  background: rgba(34,211,160,0.06);
+  border: 1px solid rgba(34,211,160,0.15);
+  border-radius: 6px;
+}
+
+.ref-filename {
+  font-size: 10px;
+  color: var(--success);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 110px;
+}
+
+.ref-dir-badge {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--success);
+  background: rgba(34,211,160,0.15);
+  padding: 2px 7px;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+
+/* ── Viewer topbar right ───────────────────────────────────────────── */
+.viewer-topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.compass-badge {
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 20px;
+  background: rgba(59,107,255,0.15);
+  color: #7b9cff;
+  font-weight: 500;
+}
+
+.btn-calibrate {
+  padding: 5px 12px;
+  border-radius: 7px;
+  border: 1px solid rgba(59,107,255,0.5);
+  background: rgba(59,107,255,0.1);
+  color: #7b9cff;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  font-family: 'Inter', system-ui, sans-serif;
+  transition: background 0.2s, border-color 0.2s;
+  white-space: nowrap;
+}
+
+.btn-calibrate:hover {
+  background: rgba(59,107,255,0.2);
+  border-color: var(--accent);
+}
+
+.btn-calibrate.recalibrate {
+  border-color: rgba(80,85,106,0.5);
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.btn-calibrate.recalibrate:hover {
+  background: var(--border);
+  color: var(--text);
+}
+
+.download-link {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-decoration: none;
+  transition: color 0.2s;
+}
+
+.download-link:hover { color: var(--text-bright); }
+
+/* ── Calibrate prompt banner ───────────────────────────────────────── */
+.calibrate-prompt {
+  position: absolute;
+  bottom: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 18px;
+  background: rgba(13,14,19,0.88);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(59,107,255,0.3);
+  border-radius: 30px;
+  font-size: 12px;
+  color: var(--text);
+  z-index: 20;
+  pointer-events: none;
+  animation: slideUp 0.3s ease;
+}
+
+.calibrate-prompt strong { color: #7b9cff; }
+
+@keyframes slideUp {
+  from { opacity: 0; transform: translateX(-50%) translateY(10px); }
+  to   { opacity: 1; transform: translateX(-50%) translateY(0); }
+}
+
+/* ── Compass Overlay ───────────────────────────────────────────────── */
+.compass-container {
+  position: absolute;
+  bottom: 20px;
+  left: 20px;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  pointer-events: none;
+  animation: fadeIn 0.4s ease;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: scale(0.9); }
+  to   { opacity: 1; transform: scale(1);   }
+}
+
+.compass-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.compass-heading-pin {
+  width: 0;
+  height: 0;
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  border-top: 8px solid rgba(255,255,255,0.7);
+  position: absolute;
+  top: -1px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2;
+  filter: drop-shadow(0 1px 3px rgba(0,0,0,0.6));
+}
+
+.compass-svg {
+  width: 90px;
+  height: 90px;
+  display: block;
+  filter: drop-shadow(0 4px 16px rgba(0,0,0,0.5));
+}
+
+/* The rose g element is rotated via SVG-native setAttribute("transform", "rotate(deg,cx,cy)")
+   so no CSS transform rules are needed here. */
+.compass-svg g {}
+
+.compass-readout {
+  margin-top: 4px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+}
+
+.readout-label {
+  font-size: 9px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.readout-value {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--text-bright);
+  font-variant-numeric: tabular-nums;
+}
+
+.readout-uncal {
+  font-size: 9px;
+  color: var(--text-muted);
+  letter-spacing: 0.5px;
+}
+
+/* Calibrated state — blue ring glow on the SVG circle */
+.compass-container.calibrated .compass-svg {
+  filter: drop-shadow(0 4px 16px rgba(0,0,0,0.5)) drop-shadow(0 0 8px rgba(59,107,255,0.4));
+}
+
+.ref-thumb-wrap {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 4px;
+}
+
+.ref-thumb {
+  width: 36px;
+  height: 28px;
+  object-fit: cover;
+  border-radius: 4px;
+  border: 1px solid var(--border-light);
+  opacity: 0.85;
+  flex-shrink: 0;
+}
+
+.ref-thumb-label {
+  font-size: 9px;
+  color: var(--text-muted);
+  letter-spacing: 0.5px;
+}
+
+/* ── 3D Direction Markers (Html from drei) ─────────────────────────── */
+.dir-marker {
+  padding: 4px 10px;
+  border-radius: 20px;
+  background: rgba(10,11,16,0.85);
+  backdrop-filter: blur(6px);
+  border: 1px solid rgba(59,107,255,0.3);
+  color: #7b9cff;
+  font-size: 12px;
+  font-weight: 700;
+  font-family: 'Inter', system-ui, sans-serif;
+  letter-spacing: 1px;
+  white-space: nowrap;
+  pointer-events: none;
+  user-select: none;
+  box-shadow: 0 2px 12px rgba(0,0,0,0.4);
+}
+
+.dir-marker.dir-north {
+  background: rgba(255,68,68,0.15);
+  border-color: rgba(255,68,68,0.5);
+  color: #ff8080;
+}
+
+/* ── Upload icon small variant ─────────────────────────────────────── */
+.upload-icon-sm {
+  opacity: 0.5;
+}
+

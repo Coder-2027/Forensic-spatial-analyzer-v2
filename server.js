@@ -16,12 +16,20 @@ app.use(express.json());
 // Serve generated models statically
 app.use("/models", express.static(path.join(__dirname, "frontend/public/models")));
 
-// Upload storage – save to input/images
+// Upload storage – scene images → input/images, reference → input/reference
 const inputDir = path.join(__dirname, "input", "images");
+const refDir   = path.join(__dirname, "input", "reference");
+const outputDir = path.join(__dirname, "output");
+
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    fs.mkdirSync(inputDir, { recursive: true });
-    cb(null, inputDir);
+    if (file.fieldname === "referenceImage") {
+      fs.mkdirSync(refDir, { recursive: true });
+      cb(null, refDir);
+    } else {
+      fs.mkdirSync(inputDir, { recursive: true });
+      cb(null, inputDir);
+    }
   },
   filename: (req, file, cb) => cb(null, file.originalname),
 });
@@ -52,12 +60,50 @@ app.get("/api/status", (req, res) => {
   });
 });
 
-// Upload endpoint
-app.post("/api/upload", upload.array("images"), (req, res) => {
-  if (!req.files || req.files.length === 0) {
-    return res.status(400).json({ error: "No files uploaded" });
+// Upload endpoint – accepts scene images + optional referenceImage + direction
+app.post("/api/upload",
+  upload.fields([
+    { name: "images",         maxCount: 500 },
+    { name: "referenceImage", maxCount: 1   },
+  ]),
+  (req, res) => {
+    const sceneFiles = req.files["images"] || [];
+    const refFiles   = req.files["referenceImage"] || [];
+    const direction  = req.body.direction || "N";
+
+    if (sceneFiles.length === 0) {
+      return res.status(400).json({ error: "No scene images uploaded" });
+    }
+
+    // Persist direction metadata alongside the model outputs
+    const meta = {
+      direction,
+      angle: { N:0,NE:45,E:90,SE:135,S:180,SW:225,W:270,NW:315 }[direction] ?? 0,
+      referenceImage: refFiles[0]?.originalname ?? null,
+      timestamp: new Date().toISOString(),
+    };
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(outputDir, "direction.json"),
+      JSON.stringify(meta, null, 2)
+    );
+
+    res.json({
+      sceneCount: sceneFiles.length,
+      referenceImage: refFiles[0]?.originalname ?? null,
+      direction,
+      message: `${sceneFiles.length} scene images + direction "${direction}" saved`,
+    });
   }
-  res.json({ count: req.files.length, message: `${req.files.length} images saved to input/images` });
+);
+
+// Direction metadata endpoint
+app.get("/api/direction", (req, res) => {
+  const metaPath = path.join(outputDir, "direction.json");
+  if (!fs.existsSync(metaPath)) {
+    return res.status(404).json({ error: "No direction metadata found" });
+  }
+  res.json(JSON.parse(fs.readFileSync(metaPath, "utf8")));
 });
 
 // Reconstruct endpoint – runs reconstruct.py and streams output
@@ -125,13 +171,17 @@ app.post("/api/reconstruct", (req, res) => {
   });
 });
 
-// Reset endpoint – clears input to allow a fresh run
+// Reset endpoint – clears input/reference + direction metadata
 app.post("/api/reset", (req, res) => {
   try {
-    if (fs.existsSync(inputDir)) {
-      fs.rmSync(inputDir, { recursive: true, force: true });
-      fs.mkdirSync(inputDir, { recursive: true });
+    for (const dir of [inputDir, refDir]) {
+      if (fs.existsSync(dir)) {
+        fs.rmSync(dir, { recursive: true, force: true });
+        fs.mkdirSync(dir, { recursive: true });
+      }
     }
+    const metaPath = path.join(outputDir, "direction.json");
+    if (fs.existsSync(metaPath)) fs.unlinkSync(metaPath);
     lastStatus = { phase: "idle", log: "", progress: 0, done: false, error: null };
     broadcast(lastStatus);
     res.json({ message: "Reset complete" });
