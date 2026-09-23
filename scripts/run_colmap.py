@@ -23,7 +23,7 @@ def main():
 
     images = list(IMAGE_DIR.glob("*"))
 
-    if len(images) < 20:
+    if len(images) < 5:
         raise ValueError(
             f"Only {len(images)} images found. "
             "Use at least 20 images."

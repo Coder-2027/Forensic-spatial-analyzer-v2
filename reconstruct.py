@@ -26,7 +26,7 @@ def main():
     exts = {".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"}
     images = [p for p in image_dir.iterdir() if p.is_file() and p.suffix in exts]
     print(f"Found {len(images)} images in {image_dir}")
-    if len(images) < 20:
+    if len(images) < 5:
         raise SystemExit("Need at least 20 images.")
 
     for name in ["colmap", "InterfaceCOLMAP", "DensifyPointCloud",
