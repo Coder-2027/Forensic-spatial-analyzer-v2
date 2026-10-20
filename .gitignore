@@ -6,6 +6,9 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+**/venv/
+**/.venv/
+**/__pycache__/
 
 # Photogrammetry input photos
 input/images/
@@ -13,7 +16,8 @@ input/images/
 # Generated reconstruction output
 output/
 
-# OpenMVS / COLMAP generated files
+# Large model weights (downloaded automatically if absent)
+threat_backend/weights/clip/
 *.dmap
 *.mvs
 *.ply

@@ -5,7 +5,11 @@
   "main": "server.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "node server.js",
+    "threat:backend": "cd threat_backend && ./venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8000",
+    "frontend": "npm --prefix frontend run dev",
+    "build": "npm --prefix frontend run build"
   },
   "repository": {
     "type": "git",
@@ -22,6 +26,7 @@
   "dependencies": {
     "cors": "^2.8.6",
     "express": "^5.2.1",
-    "multer": "^2.4.0"
+    "multer": "^2.4.0",
+    "pngjs": "^7.0.0"
   }
 }

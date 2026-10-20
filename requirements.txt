@@ -1,0 +1,6 @@
+numpy
+pillow
+trimesh
+scipy
+networkx
+pycolmap

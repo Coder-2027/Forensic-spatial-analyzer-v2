@@ -1,8 +1,11 @@
-import { useState, useRef, useCallback, useEffect, Suspense } from "react";
+import { useState, useRef, useCallback, useEffect, useMemo, Suspense } from "react";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { OrbitControls, Environment, Grid, useGLTF, Html } from "@react-three/drei";
 import * as THREE from "three";
 import "./index.css";
+import ForensicSimulation, { SceneAnchorMarker } from "./components/ForensicSimulation";
+import RecreationStudio from "./components/RecreationStudio";
+import ThreatDetectionTab from "./components/threat/ThreatDetectionTab";
 
 const API = ""; // Vite proxies /api and /models → http://localhost:3001
 
@@ -10,83 +13,438 @@ const API = ""; // Vite proxies /api and /models → http://localhost:3001
 const DIRECTIONS = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
 const DIR_ANGLES = { N: 0, NE: 45, E: 90, SE: 135, S: 180, SW: 225, W: 270, NW: 315 };
 
+// ── WebGL Canvas DOM Element Capture for Video Recording ──────────────
+function CanvasCaptureRef({ canvasRef }) {
+  const { gl } = useThree();
+  useEffect(() => {
+    if (gl?.domElement) canvasRef.current = gl.domElement;
+  }, [gl, canvasRef]);
+  return null;
+}
+
+// ── 60 FPS Synchronized Simulation Clock ──────────────────────────────
+function SimulationClock({ isPlaying, speed, onTick }) {
+  useFrame((_, delta) => {
+    if (isPlaying) {
+      onTick(delta * speed);
+    }
+  });
+  return null;
+}
+
+// ── Forensic Spatial Room (shown when no photogrammetry mesh loaded) ──
+function ForensicSpatialRoom({ center = [0, 0, 0], radius = 4, northOffset = 0, roomSize = null }) {
+  const halfX = roomSize ? roomSize[0] * 0.48 : radius;
+  const halfZ = roomSize ? roomSize[2] * 0.48 : radius;
+
+  const cardinals = [
+    { label: "N", relPos: [0, -halfZ], color: "#ff6b6b", isNorth: true },
+    { label: "S", relPos: [0, halfZ], color: "#94a3b8" },
+    { label: "E", relPos: [halfX, 0], color: "#94a3b8" },
+    { label: "W", relPos: [-halfX, 0], color: "#94a3b8" },
+    { label: "NE", relPos: [halfX, -halfZ], color: "#64748b" },
+    { label: "NW", relPos: [-halfX, -halfZ], color: "#64748b" },
+    { label: "SE", relPos: [halfX, halfZ], color: "#64748b" },
+    { label: "SW", relPos: [-halfX, halfZ], color: "#64748b" },
+  ];
+
+  const rotRad = (northOffset * Math.PI) / 180;
+  const cosR = Math.cos(rotRad);
+  const sinR = Math.sin(rotRad);
+
+  return (
+    <group position={[center[0], 0, center[2]]}>
+      {/* Rectangular room boundary floor outline */}
+      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.005, 0]}>
+        <planeGeometry args={[halfX * 2, halfZ * 2]} />
+        <meshBasicMaterial color="#3b6bff" wireframe opacity={0.25} transparent />
+      </mesh>
+
+      {/* Cardinal & corner perimeter markers */}
+      {cardinals.map(({ label, relPos, color }) => {
+        const px = relPos[0] * cosR - relPos[1] * sinR;
+        const pz = relPos[0] * sinR + relPos[1] * cosR;
+        return (
+          <group key={label} position={[px, 0.02, pz]}>
+            <mesh rotation={[-Math.PI / 2, 0, 0]}>
+              <ringGeometry args={[0.15, 0.22, 24]} />
+              <meshBasicMaterial color={color} side={THREE.DoubleSide} />
+            </mesh>
+            <Html position={[0, 0.35, 0]} center distanceFactor={14}>
+              <div
+                style={{
+                  padding: "2px 8px",
+                  borderRadius: "12px",
+                  background: label === "N" ? "rgba(239, 68, 68, 0.25)" : "rgba(15, 23, 42, 0.85)",
+                  border: `1px solid ${color}`,
+                  color: color,
+                  fontSize: "11px",
+                  fontWeight: "700",
+                  pointerEvents: "none",
+                  userSelect: "none",
+                }}
+              >
+                {label}
+              </div>
+            </Html>
+          </group>
+        );
+      })}
+    </group>
+  );
+}
+
 // ── 3D Model + auto-fit camera to bounding box ────────────────────────
-function ModelWithCamera({ url, controlsRef, onModelInfo }) {
+function ModelWithCamera({
+  url,
+  controlsRef,
+  onModelInfo,
+  northOffset = 0,
+}) {
   const { scene } = useGLTF(url);
   const { camera } = useThree();
   const groupRef = useRef();
+  const [modelTransform, setModelTransform] = useState(null);
+  const [boundsInfo, setBoundsInfo] = useState(null);
 
   useEffect(() => {
-    if (!groupRef.current) return;
-    // Compute bounding box of the model (including Y-up rotation)
-    const box = new THREE.Box3().setFromObject(groupRef.current);
-    const center = new THREE.Vector3();
-    const size = new THREE.Vector3();
-    box.getCenter(center);
-    box.getSize(size);
+    if (!groupRef.current || !scene) return;
 
-    const maxDim = Math.max(size.x, size.y, size.z) || 5;
+    // 1. Ensure photogrammetry mesh renders with true photographic colors and zero shadow acne
+    scene.traverse((child) => {
+      if (child.isMesh) {
+        child.frustumCulled = false;
+        // Never cast self-shadows on complex photogrammetry scan mesh (eliminates shadow acne and black speckles)
+        child.castShadow = false;
+        child.receiveShadow = false;
+
+        if (child.material) {
+          child.material.side = THREE.DoubleSide;
+          child.material.depthWrite = true;
+          child.material.transparent = false;
+          child.material.opacity = 1.0;
+
+          if (child.material.map) {
+            child.material.map.colorSpace = THREE.SRGBColorSpace;
+            child.material.map.minFilter = THREE.LinearMipmapLinearFilter;
+            child.material.map.magFilter = THREE.LinearFilter;
+            child.material.map.generateMipmaps = true;
+            child.material.map.needsUpdate = true;
+          }
+
+          // Unlit photographic colors: renders exact camera photo pixels with zero shadow acne or dark blotches
+          if (!child.material.isMeshBasicMaterial) {
+            const oldMap = child.material.map;
+            child.material = new THREE.MeshBasicMaterial({
+              map: oldMap,
+              side: THREE.DoubleSide,
+              color: 0xffffff,
+            });
+          }
+          child.material.needsUpdate = true;
+        }
+      }
+    });
+
+    // 2. Reset transforms for accurate measurement
+    groupRef.current.position.set(0, 0, 0);
+    groupRef.current.scale.set(1, 1, 1);
+    groupRef.current.rotation.set(0, 0, 0);
+    groupRef.current.updateMatrixWorld(true);
+
+    // 3. Sample mesh vertices and normals to detect orientation & robust percentiles
+    const xs = [];
+    const ys = [];
+    const zs = [];
+    let upNormals = 0;
+    let downNormals = 0;
+
+    scene.traverse((child) => {
+      if (child.isMesh && child.geometry?.attributes?.position) {
+        const pos = child.geometry.attributes.position;
+        const norm = child.geometry.attributes.normal;
+        const index = child.geometry.index;
+        const v = new THREE.Vector3();
+        const step = Math.max(1, Math.floor(pos.count / 2500));
+        for (let i = 0; i < pos.count; i += step) {
+          v.fromBufferAttribute(pos, i);
+          xs.push(v.x);
+          ys.push(v.y);
+          zs.push(v.z);
+        }
+
+        if (norm) {
+          const n = new THREE.Vector3();
+          for (let i = 0; i < norm.count; i += step) {
+            n.fromBufferAttribute(norm, i);
+            if (n.y > 0.4) upNormals++;
+            else if (n.y < -0.4) downNormals++;
+          }
+        } else if (index) {
+          // Direct face normal sampling when vertex normals are not present
+          const vA = new THREE.Vector3();
+          const vB = new THREE.Vector3();
+          const vC = new THREE.Vector3();
+          const cb = new THREE.Vector3();
+          const ab = new THREE.Vector3();
+          const fStep = Math.max(1, Math.floor(index.count / 3000)) * 3;
+          for (let i = 0; i < index.count - 2; i += fStep) {
+            vA.fromBufferAttribute(pos, index.getX(i));
+            vB.fromBufferAttribute(pos, index.getX(i + 1));
+            vC.fromBufferAttribute(pos, index.getX(i + 2));
+            cb.subVectors(vC, vB);
+            ab.subVectors(vA, vB);
+            cb.cross(ab).normalize();
+            if (cb.y > 0.35) upNormals++;
+            else if (cb.y < -0.35) downNormals++;
+          }
+        }
+      }
+    });
+
+    if (xs.length < 10) return;
+
+    // In COLMAP / OpenMVS, cameras use OpenCV Y-down coordinates, so floor surfaces predominantly face -Y (downNormals > upNormals).
+    // An un-flipped COLMAP mesh needs rotationX = Math.PI to be upright (+Y up) in Three.js.
+    const isCOLMAPInverted = downNormals > upNormals || (upNormals === 0 && downNormals === 0);
+    const rotationX = isCOLMAPInverted ? Math.PI : 0;
+
+    // Detect upward floor normal to level the room mesh horizontally
+    let floorNx = 0, floorNy = 0, floorNz = 0, floorCount = 0;
+    scene.traverse((child) => {
+      if (child.isMesh && child.geometry?.attributes?.position) {
+        const norm = child.geometry.attributes.normal;
+        if (norm) {
+          const n = new THREE.Vector3();
+          const step = Math.max(1, Math.floor(norm.count / 2500));
+          for (let i = 0; i < norm.count; i += step) {
+            n.fromBufferAttribute(norm, i);
+            const ny = isCOLMAPInverted ? -n.y : n.y;
+            const nz = isCOLMAPInverted ? -n.z : n.z;
+            const nx = n.x;
+            if (ny > 0.5) {
+              floorNx += nx; floorNy += ny; floorNz += nz;
+              floorCount++;
+            }
+          }
+        }
+      }
+    });
+
+    let tiltRotX = 0;
+    let tiltRotZ = 0;
+    if (floorCount > 20) {
+      floorNx /= floorCount; floorNy /= floorCount; floorNz /= floorCount;
+      const len = Math.hypot(floorNx, floorNy, floorNz) || 1;
+      floorNx /= len; floorNy /= len; floorNz /= len;
+      tiltRotX = -Math.atan2(floorNz, floorNy);
+      tiltRotZ = Math.atan2(floorNx, floorNy);
+    }
+
+    if (isCOLMAPInverted) {
+      const qFlip = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI);
+      const qLevel = new THREE.Quaternion().setFromEuler(new THREE.Euler(tiltRotX, 0, tiltRotZ, "XYZ"));
+      groupRef.current.quaternion.copy(qLevel.multiply(qFlip));
+    } else {
+      groupRef.current.rotation.set(tiltRotX, 0, tiltRotZ);
+    }
+    groupRef.current.rotation.setFromQuaternion(groupRef.current.quaternion, "XYZ");
+    groupRef.current.updateMatrixWorld(true);
+
+    // Sample vertices in world coordinate space (with rotation applied)
+    const worldXs = [];
+    const worldYs = [];
+    const worldZs = [];
+
+    scene.traverse((child) => {
+      if (child.isMesh && child.geometry?.attributes?.position) {
+        const pos = child.geometry.attributes.position;
+        const v = new THREE.Vector3();
+        const step = Math.max(1, Math.floor(pos.count / 2500));
+        for (let i = 0; i < pos.count; i += step) {
+          v.fromBufferAttribute(pos, i);
+          v.applyMatrix4(child.matrixWorld);
+          worldXs.push(v.x);
+          worldYs.push(v.y);
+          worldZs.push(v.z);
+        }
+      }
+    });
+
+    worldXs.sort((a, b) => a - b);
+    worldYs.sort((a, b) => a - b);
+    worldZs.sort((a, b) => a - b);
+
+    const N = worldXs.length;
+    // Robust 1.5% and 98.5% percentiles eliminate stray floating noise points
+    const p1_x = worldXs[Math.floor(N * 0.015)];
+    const p99_x = worldXs[Math.floor(N * 0.985)];
+    const p1_z = worldZs[Math.floor(N * 0.015)];
+    const p99_z = worldZs[Math.floor(N * 0.985)];
+
+    // Floor and ceiling
+    const floorY = worldYs[Math.floor(N * 0.025)];
+    const ceilingY = worldYs[Math.floor(N * 0.975)];
+    const rawHeight = Math.max(1.0, ceilingY - floorY);
+
+    const centerX = (p1_x + p99_x) / 2;
+    const centerZ = (p1_z + p99_z) / 2;
+
+    const spanX = Math.max(2.0, p99_x - p1_x);
+    const spanZ = Math.max(2.0, p99_z - p1_z);
+
+    // Normalize height if unrealistically large (> 5.5m) or small (< 2.2m)
+    let modelScale = 1.0;
+    if (rawHeight > 5.5 || rawHeight < 2.2) {
+      modelScale = THREE.MathUtils.clamp(3.8 / rawHeight, 0.4, 2.5);
+    }
+
+    // Check if mesh is already pre-enhanced, leveled, and canonical
+    const isPreEnhanced = !isCOLMAPInverted &&
+      Math.abs(tiltRotX) < 0.08 &&
+      Math.abs(tiltRotZ) < 0.08 &&
+      Math.abs(centerX) < 0.8 &&
+      Math.abs(centerZ) < 0.8 &&
+      Math.abs(floorY) < 0.35 &&
+      rawHeight >= 2.0 && rawHeight <= 5.5;
+
+    let finalPos = [-centerX * modelScale, -floorY * modelScale, -centerZ * modelScale];
+    let finalRotation = [groupRef.current.rotation.x, groupRef.current.rotation.y, groupRef.current.rotation.z];
+
+    if (isPreEnhanced) {
+      // Keep exact 1:1 world coordinate correspondence with ForensicSimulation
+      groupRef.current.position.set(0, 0, 0);
+      groupRef.current.rotation.set(0, 0, 0);
+      groupRef.current.scale.set(1, 1, 1);
+      groupRef.current.updateMatrixWorld(true);
+      modelScale = 1.0;
+      finalPos = [0, 0, 0];
+      finalRotation = [0, 0, 0];
+    } else {
+      groupRef.current.scale.setScalar(modelScale);
+      groupRef.current.position.set(finalPos[0], finalPos[1], finalPos[2]);
+      groupRef.current.updateMatrixWorld(true);
+    }
+
+    const finalSizeX = spanX * modelScale;
+    const finalSizeY = rawHeight * modelScale;
+    const finalSizeZ = spanZ * modelScale;
+
+    setModelTransform({
+      position: finalPos,
+      scale: modelScale,
+      rotation: finalRotation,
+    });
+
+    setBoundsInfo({
+      width: finalSizeX,
+      height: finalSizeY,
+      depth: finalSizeZ,
+    });
+
+    const maxSpan = Math.max(finalSizeX, finalSizeZ);
+    const roomRadius = Math.min(finalSizeX, finalSizeZ) * 0.44;
+
+    // Position camera to look directly into the centered room at actor height (1.2m)
     const fovRad = (camera.fov * Math.PI) / 180;
-    const dist = (maxDim / 2 / Math.tan(fovRad / 2)) * 1.6;
+    const dist = (maxSpan / 2 / Math.tan(fovRad / 2)) * 1.25;
+    const camY = THREE.MathUtils.clamp(finalSizeY * 0.65, 1.8, 4.5);
 
-    // Position camera above and in front of scene center
-    camera.position.set(center.x, center.y + maxDim * 0.35, center.z + dist);
-    camera.near = Math.max(0.01, maxDim * 0.001);
-    camera.far = maxDim * 200;
+    const rad = ((northOffset || 0) * Math.PI) / 180;
+    const nx = Math.sin(rad);
+    const nz = -Math.cos(rad);
+    camera.position.set(-nx * dist, camY, -nz * dist);
+    camera.near = 0.05;
+    camera.far = maxSpan * 50;
     camera.updateProjectionMatrix();
 
     if (controlsRef?.current) {
-      controlsRef.current.target.copy(center);
+      controlsRef.current.target.set(0, 1.2, 0);
       controlsRef.current.update();
     }
 
     if (onModelInfo) {
-      onModelInfo({ center: [center.x, center.y, center.z], size: [size.x, size.y, size.z], maxDim });
+      onModelInfo({
+        center: [0, 0, 0],
+        floorY: 0,
+        size: [finalSizeX, finalSizeY, finalSizeZ],
+        radius: roomRadius,
+        maxDim: maxSpan,
+        modelScale,
+      });
     }
-  }, [scene]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [scene, url, northOffset]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
-    <group ref={groupRef} rotation={[Math.PI, 0, 0]}>
-      <primitive object={scene} />
+    <group>
+      <group
+        ref={groupRef}
+        position={modelTransform ? modelTransform.position : [0, 0, 0]}
+        scale={modelTransform ? modelTransform.scale : 1}
+        rotation={modelTransform ? modelTransform.rotation : [0, 0, 0]}
+      >
+        <primitive object={scene} />
+      </group>
     </group>
   );
 }
 
 // ── Camera azimuth tracker (inside Canvas context) ────────────────────
 function CameraTracker({ azimuthRef, controlsRef }) {
+  const dirVec = useRef(new THREE.Vector3());
   useFrame(() => {
-    if (!controlsRef.current) return;
+    if (!controlsRef.current?.object) return;
     const cam = controlsRef.current.object;
-    const target = controlsRef.current.target;
-    const dx = cam.position.x - target.x;
-    const dz = cam.position.z - target.z;
-    azimuthRef.current = Math.atan2(dx, dz) * (180 / Math.PI);
+    cam.getWorldDirection(dirVec.current);
+    // In Three.js: -Z is North (0°), +X is East (90°), +Z is South (180°), -X is West (270°)
+    const az = (Math.atan2(dirVec.current.x, -dirVec.current.z) * (180 / Math.PI) + 360) % 360;
+    azimuthRef.current = az;
   });
   return null;
 }
 
-// ── 3D Direction Markers (shown after calibration) ───────────────────
-function DirectionMarkers({ northOffset, target = [0, 0, 0], radius = 5 }) {
+// ── 3D Direction Markers (8 Directions, dynamically mapped to room walls & corners) ───────
+function DirectionMarkers({ northOffset = 0, target = [0, 0, 0], radius = 2.4, roomSize = null, onSelectDirection }) {
+  const halfX = roomSize ? roomSize[0] * 0.48 : Math.max(2.4, (radius || 2.6) * 0.95);
+  const halfZ = roomSize ? roomSize[2] * 0.48 : Math.max(2.4, (radius || 2.6) * 0.95);
+
   const cardinals = [
-    { label: "N", offset: 0 },
-    { label: "E", offset: 90 },
-    { label: "S", offset: 180 },
-    { label: "W", offset: 270 },
+    { label: "N", relPos: [0, -halfZ], isPrimary: true, isNorth: true },
+    { label: "S", relPos: [0, halfZ], isPrimary: true },
+    { label: "E", relPos: [halfX, 0], isPrimary: true },
+    { label: "W", relPos: [-halfX, 0], isPrimary: true },
+    { label: "NE", relPos: [halfX, -halfZ], isPrimary: false },
+    { label: "NW", relPos: [-halfX, -halfZ], isPrimary: false },
+    { label: "SE", relPos: [halfX, halfZ], isPrimary: false },
+    { label: "SW", relPos: [-halfX, halfZ], isPrimary: false },
   ];
+
+  const rotRad = (northOffset * Math.PI) / 180;
+  const cosR = Math.cos(rotRad);
+  const sinR = Math.sin(rotRad);
 
   return (
     <>
-      {cardinals.map(({ label, offset }) => {
-        // World-space angle for this direction
-        const worldAngle = (northOffset + offset) * (Math.PI / 180);
-        // Position in XZ plane around target center
-        const px = target[0] - Math.sin(worldAngle) * radius;
-        const pz = target[2] - Math.cos(worldAngle) * radius;
-        const py = target[1];
-        const isNorth = label === "N";
+      {cardinals.map(({ label, relPos, isPrimary, isNorth }) => {
+        // Position in XZ plane: pure walls at N (-Z), S (+Z), E (+X), W (-X) and corners at diagonals
+        const rx = relPos[0] * cosR - relPos[1] * sinR;
+        const rz = relPos[0] * sinR + relPos[1] * cosR;
+        const px = target[0] + rx;
+        const pz = target[2] + rz;
+        const py = target[1] || 0.02;
         return (
-          <Html key={label} position={[px, py + 0.3, pz]} center>
-            <div className={`dir-marker ${isNorth ? "dir-north" : ""}`}>
+          <Html key={label} position={[px, py + 0.3, pz]} center distanceFactor={18}>
+            <div
+              className={`dir-marker ${
+                isNorth ? "dir-north" : !isPrimary ? "dir-intercardinal" : ""
+              }`}
+              style={{ cursor: "pointer" }}
+              title={`Click to face ${label}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                onSelectDirection?.(label);
+              }}
+            >
               {label}
             </div>
           </Html>
@@ -97,7 +455,7 @@ function DirectionMarkers({ northOffset, target = [0, 0, 0], radius = 5 }) {
 }
 
 // ── Compass Rose (HTML overlay, outside Canvas) ───────────────────────
-function CompassOverlay({ azimuthRef, northOffset, calibrated, refImageUrl, refDirection }) {
+function CompassOverlay({ azimuthRef, northOffset = 0, onAlignDirection }) {
   const roseRef = useRef(null);
   const [facing, setFacing] = useState("—");
 
@@ -109,8 +467,6 @@ function CompassOverlay({ azimuthRef, northOffset, calibrated, refImageUrl, refD
 
       if (roseRef.current) {
         // SVG-native rotate(angle, cx, cy) — pivot always at SVG centre (70,70).
-        // CSS transform-origin drifts with transform-box:fill-box and causes
-        // labels / needles to escape the circle boundary during rotation.
         roseRef.current.setAttribute("transform", `rotate(${rot}, 70, 70)`);
       }
 
@@ -125,23 +481,21 @@ function CompassOverlay({ azimuthRef, northOffset, calibrated, refImageUrl, refD
   }, [azimuthRef, northOffset]);
 
   return (
-    <div className={`compass-container ${calibrated ? "calibrated" : ""}`}>
-      {/* Reference photo thumbnail */}
-      {refImageUrl && (
-        <div className="ref-thumb-wrap">
-          <img src={refImageUrl} alt="Reference" className="ref-thumb" />
-          <div className="ref-thumb-label">
-            Ref · {refDirection}
-          </div>
-        </div>
-      )}
-
+    <div className="compass-container calibrated">
       {/* Compass rose */}
-      <div className="compass-card">
+      <div
+        className="compass-card"
+        title="Compass · Click to face North"
+      >
         {/* Heading indicator (fixed at top) */}
         <div className="compass-heading-pin" />
 
-        <svg viewBox="0 0 140 140" className="compass-svg">
+        <svg
+          viewBox="0 0 140 140"
+          className="compass-svg"
+          onClick={() => onAlignDirection?.("N")}
+          style={{ cursor: "pointer" }}
+        >
           <defs>
             {/* Clip the rotating rose so needles/labels never bleed outside the bezel */}
             <clipPath id="compass-rose-clip">
@@ -152,7 +506,7 @@ function CompassOverlay({ azimuthRef, northOffset, calibrated, refImageUrl, refD
           {/* Outer bezel (fixed) */}
           <circle cx="70" cy="70" r="66"
             fill="rgba(10,11,16,0.9)"
-            stroke={calibrated ? "rgba(59,107,255,0.6)" : "rgba(30,33,48,0.9)"}
+            stroke="rgba(59,107,255,0.6)"
             strokeWidth="1.5"
           />
 
@@ -196,6 +550,11 @@ function CompassOverlay({ azimuthRef, northOffset, calibrated, refImageUrl, refD
                   fontSize={fs}
                   fontWeight={fw}
                   fontFamily="Inter, system-ui, sans-serif"
+                  style={{ cursor: "pointer" }}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onAlignDirection?.(l);
+                  }}
                 >{l}</text>
               );
             })}
@@ -214,6 +573,11 @@ function CompassOverlay({ azimuthRef, northOffset, calibrated, refImageUrl, refD
                   fill="#3d4560"
                   fontSize="8"
                   fontFamily="Inter, system-ui, sans-serif"
+                  style={{ cursor: "pointer" }}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onAlignDirection?.(l);
+                  }}
                 >{l}</text>
               );
             })}
@@ -226,10 +590,19 @@ function CompassOverlay({ azimuthRef, northOffset, calibrated, refImageUrl, refD
 
         {/* Current facing direction readout */}
         <div className="compass-readout">
-          {calibrated
-            ? <><span className="readout-label">Facing</span><span className="readout-value">{facing}</span></>
-            : <span className="readout-uncal">Uncalibrated</span>
-          }
+          <span className="readout-label">Facing</span>
+          <span className="readout-value">{facing}</span>
+          <button
+            type="button"
+            className="compass-snap-btn"
+            onClick={(e) => {
+              e.stopPropagation();
+              onAlignDirection?.("N");
+            }}
+            title="Face North"
+          >
+            🎯 Face North
+          </button>
         </div>
       </div>
     </div>
@@ -264,10 +637,8 @@ function BuildingIcon() {
 function Sidebar({
   files, isDragOver, fileInputRef,
   onDrop, onDragOver, onDragLeave, onFileChange, onZoneClick,
-  refFile, refPreview, refDirection, refInputRef,
-  onRefZoneClick, onRefFileChange, onRefDirChange,
-  onRefDrop, onRefDragOver, onRefDragLeave, isRefDragOver,
   status, logs, onGenerate, onReset, isRunning,
+  onOpenThreatDetection,
 }) {
   const dotClass =
     status.done ? "done"
@@ -323,78 +694,32 @@ function Sidebar({
           multiple style={{ display: "none" }} onChange={onFileChange} />
       </div>
 
-      {/* ── Reference Image + Direction */}
-      <div className="sidebar-section">
-        <div className="section-label">Reference Image &amp; Direction</div>
-        <div className="ref-upload-row">
-          {/* Small drop zone */}
-          <div
-            className={`ref-zone${isRefDragOver ? " drag-over" : ""}${refFile ? " has-file" : ""}`}
-            onClick={onRefZoneClick}
-            onDrop={onRefDrop}
-            onDragOver={onRefDragOver}
-            onDragLeave={onRefDragLeave}
-          >
-            {refPreview
-              ? <img src={refPreview} alt="ref" className="ref-preview-thumb" />
-              : <>
-                <UploadIcon small />
-                <span className="ref-zone-hint">1 photo</span>
-              </>
-            }
-          </div>
-          <input id="ref-input" ref={refInputRef} type="file" accept="image/*"
-            style={{ display: "none" }} onChange={onRefFileChange} />
-
-          {/* Direction select */}
-          <div className="dir-select-wrap">
-            <div className="dir-select-label">Camera facing</div>
-            <select
-              id="direction-select"
-              className="dir-select"
-              value={refDirection}
-              onChange={(e) => onRefDirChange(e.target.value)}
-            >
-              {DIRECTIONS.map((d) => (
-                <option key={d} value={d}>{d}</option>
-              ))}
-            </select>
-            <div className="dir-compass-icon">
-              {/* tiny compass */}
-              <svg viewBox="0 0 24 24" fill="none" className="dir-icon-svg">
-                <circle cx="12" cy="12" r="10" stroke="#3d4560" strokeWidth="1.5" />
-                <polygon points="12,4 10,12 12,10 14,12" fill="#ff4444" />
-                <polygon points="12,20 10,12 12,14 14,12" fill="#3d4560" />
-                <circle cx="12" cy="12" r="1.5" fill="#e8eaf0" />
-              </svg>
-              <span className="dir-angle-hint">{DIR_ANGLES[refDirection]}°</span>
-            </div>
-          </div>
-        </div>
-        {refFile && (
-          <div className="ref-info-row">
-            <span className="ref-filename">{refFile.name}</span>
-            <span className="ref-dir-badge">{refDirection}</span>
-          </div>
-        )}
-      </div>
-
       {/* ── Actions */}
       <div className="sidebar-actions">
         <button id="btn-generate" className="btn-generate"
           onClick={onGenerate}
-          disabled={files.length === 0 || isRunning}
+          disabled={files.length === 0 || (isRunning && !status.error)}
         >
-          {isRunning
+          {isRunning && !status.error
             ? <><div className="spinner" /> Processing…</>
-            : <><span className="btn-icon">✦</span> Generate 3D Room</>}
+            : status.error
+              ? <><span className="btn-icon">↺</span> Retry 3D Generation</>
+              : <><span className="btn-icon">✦</span> Generate 3D Room</>}
         </button>
-        {(files.length > 0 || status.done) && (
+        {(files.length > 0 || status.done || status.error) && (
           <button id="btn-reset" className="btn-reset"
-            onClick={onReset} disabled={isRunning}>
+            onClick={onReset} disabled={isRunning && !status.error}>
             ↺ Reset
           </button>
         )}
+        <button
+          type="button"
+          className="btn-threat-analysis"
+          onClick={onOpenThreatDetection}
+          title="Open AI Weapon & Threat Detection Tab"
+        >
+          <span>🔬</span> Weapon &amp; Threat Detection Tab →
+        </button>
       </div>
 
       {/* ── Status */}
@@ -451,23 +776,20 @@ function LogConsole({ logs }) {
 
 // ── Main App ──────────────────────────────────────────────────────────
 export default function App() {
+  // View mode tab: "3d_scene" (3D Room Reconstruction) or "recreation" (Crime Recreation Studio)
+  const [activeTab, setActiveTab] = useState("3d_scene");
+
   // Scene photos
   const [files, setFiles] = useState([]);
   const [isDragOver, setIsDragOver] = useState(false);
   const fileInputRef = useRef(null);
 
-  // Reference image
-  const [refFile, setRefFile] = useState(null);
-  const [refPreview, setRefPreview] = useState(null);
-  const [refDirection, setRefDirection] = useState("N");
-  const [isRefDragOver, setIsRefDragOver] = useState(false);
-  const refInputRef = useRef(null);
-
-  // Compass calibration
+  // Compass calibration - default North aligns room symmetrically
   const [northOffset, setNorthOffset] = useState(0);
-  const [compassCalibrated, setCalibrated] = useState(false);
+  const [compassCalibrated, setCalibrated] = useState(true);
   const azimuthRef = useRef(0); // live camera azimuth (updated each frame)
   const controlsRef = useRef(null);
+  const canvasRef = useRef(null);
 
   // Reconstruction state
   const [status, setStatus] = useState({ phase: "idle", log: "", progress: 0, done: false, error: null });
@@ -478,7 +800,146 @@ export default function App() {
   const [modelInfo, setModelInfo] = useState(null);
   const sseRef = useRef(null);
 
-  // ── SSE connection
+  // ── Crime Recreation & Video Simulation State ────────────────────────
+  const [planData, setPlanData] = useState(null);
+  const [sceneObjects, setSceneObjects] = useState([]);
+  const [isPlanning, setIsPlanning] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [playbackSpeed, setPlaybackSpeed] = useState(1.0);
+  const [cameraMode, setCameraMode] = useState("orbit");
+  const [showRoutes, setShowRoutes] = useState(true);
+  const [showLabels, setShowLabels] = useState(true);
+  const [showAnchors, setShowAnchors] = useState(false);
+  const [geminiApiKey, setGeminiApiKey] = useState(
+    () => localStorage.getItem("forensic_gemini_key") || ""
+  );
+
+  // ── Fetch physical room objects and 8-direction labels ───────────────
+  const fetchSceneObjects = useCallback(async () => {
+    try {
+      const r = await fetch(`${API}/api/scene/objects`);
+      if (r.ok) {
+        const data = await r.json();
+        if (data.objects) setSceneObjects(data.objects);
+        if (data.northOffset !== undefined) {
+          setNorthOffset(data.northOffset);
+          setCalibrated(true);
+        }
+      }
+    } catch (_) {}
+  }, []);
+
+  // ── On mount / page refresh: clean up any earlier models so the user starts fresh ──
+  useEffect(() => {
+    setModelUrl(null);
+    setModelInfo(null);
+    setPlanData(null);
+    setSceneObjects([]);
+    setStatus({ phase: "idle", log: "", progress: 0, done: false, error: null });
+    // Tell backend to thoroughly clean up previous model artifacts
+    fetch(`${API}/api/reset`, { method: "POST" }).catch(() => {});
+  }, []);
+
+  const modelUrlToLoad = modelUrl;
+
+  // ── Plan generation handler ──────────────────────────────────────────
+  const handleGenerateRecreationPlan = useCallback(
+    async (promptText) => {
+      setIsPlanning(true);
+      try {
+        const halfX = (modelInfo?.size?.[0] || 6.0) / 2;
+        const halfZ = (modelInfo?.size?.[2] || 6.0) / 2;
+        const heightY = modelInfo?.size?.[1] || 3.8;
+        const boundsPayload = {
+          min: [-halfX, 0, -halfZ],
+          max: [halfX, heightY, halfZ],
+          center: [0, 0, 0],
+          size: [halfX * 2, heightY, halfZ * 2],
+          radius: modelInfo?.radius || Math.hypot(halfX, halfZ) * 0.7,
+        };
+
+        const res = await fetch(`${API}/api/recreation/plan`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            prompt: promptText,
+            apiKey: geminiApiKey || undefined,
+            bounds: boundsPayload,
+            directionMeta: {
+              direction: "N",
+              northOffset: northOffset || 0,
+              calibrated: true,
+            },
+          }),
+        });
+
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          throw new Error(errData.error || `Server responded with ${res.status}`);
+        }
+
+        const data = await res.json();
+        setPlanData(data);
+        setCurrentTime(0);
+        setIsPlaying(true);
+      } catch (err) {
+        console.error("Recreation plan error:", err);
+        alert(`Error generating simulation: ${err.message}`);
+      } finally {
+        setIsPlanning(false);
+      }
+    },
+    [geminiApiKey, modelInfo, northOffset, compassCalibrated]
+  );
+
+  // ── Auto-load saved recreation plan if available on server ───────────
+  useEffect(() => {
+    fetch(`${API}/api/recreation/plan`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (data?.plan) {
+          setPlanData(data);
+          setCurrentTime(0);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  // ── Clock tick handler ───────────────────────────────────────────────
+  const duration = planData?.plan?.duration || 10;
+  const handleClockTick = useCallback(
+    (deltaSec) => {
+      setCurrentTime((prev) => {
+        const next = prev + deltaSec;
+        if (next >= duration) {
+          setIsPlaying(false);
+          return duration;
+        }
+        return next;
+      });
+    },
+    [duration]
+  );
+
+  // ── Active narrative caption computed from timeline ──────────────────
+  const activeCaption = useMemo(() => {
+    if (!planData?.plan?.captions) return "";
+    let cap = "";
+    for (const c of planData.plan.captions) {
+      if (c.t <= currentTime) cap = c.text;
+    }
+    return cap;
+  }, [planData, currentTime]);
+
+  // ── Gemini API key storage ───────────────────────────────────────────
+  const handleApiKeyChange = useCallback((newKey) => {
+    setGeminiApiKey(newKey);
+    if (newKey) localStorage.setItem("forensic_gemini_key", newKey);
+    else localStorage.removeItem("forensic_gemini_key");
+  }, []);
+
+  // ── SSE connection ───────────────────────────────────────────────────
   useEffect(() => {
     const es = new EventSource(`${API}/api/status`);
     sseRef.current = es;
@@ -490,155 +951,342 @@ export default function App() {
         setIsRunning(false);
         setModelUrl(`${API}/models/scene_textured.glb?t=${Date.now()}`);
         setModelKey((k) => k + 1);
+        fetchSceneObjects();
       }
-      if (data.error) setIsRunning(false);
+      if (data.error || data.phase === "error") {
+        setIsRunning(false);
+      }
     };
     return () => es.close();
-  }, []);
+  }, [fetchSceneObjects]);
 
-  // ── Scene photo handling
+  // ── Align 3D Camera to Cardinal Direction (e.g. North) ────────────────
+  const alignCameraToDirection = useCallback(
+    (dir = "N") => {
+      if (!controlsRef.current) return;
+      const cam = controlsRef.current.object;
+      const target = controlsRef.current.target || new THREE.Vector3(0, 1.2, 0);
+      const dist = Math.hypot(cam.position.x - target.x, cam.position.z - target.z) || 5.0;
+      const camY = THREE.MathUtils.clamp(cam.position.y, 1.8, 4.5);
+
+      const targetDirAngle = DIR_ANGLES[dir] ?? 0;
+      const rad = ((northOffset + targetDirAngle) * Math.PI) / 180;
+      const nx = Math.sin(rad);
+      const nz = -Math.cos(rad);
+
+      cam.position.set(target.x - nx * dist, camY, target.z - nz * dist);
+      controlsRef.current.update();
+    },
+    [northOffset]
+  );
+
+  // ── Scene photo handling ─────────────────────────────────────────────
   const handleDrop = useCallback((e) => {
-    e.preventDefault(); setIsDragOver(false);
+    e.preventDefault();
+    setIsDragOver(false);
+    setModelUrl(null);
+    setModelInfo(null);
+    setPlanData(null);
+    setSceneObjects([]);
+    setStatus({ phase: "idle", log: "", progress: 0, done: false, error: null });
+    setIsRunning(false);
     setFiles(Array.from(e.dataTransfer.files).filter((f) => f.type.startsWith("image/")));
+    fetch(`${API}/api/reset`, { method: "POST" }).catch(() => {});
   }, []);
   const handleDragOver = useCallback((e) => { e.preventDefault(); setIsDragOver(true); }, []);
   const handleDragLeave = useCallback(() => setIsDragOver(false), []);
-  const handleFileChange = useCallback((e) => setFiles(Array.from(e.target.files)), []);
+  const handleFileChange = useCallback((e) => {
+    setModelUrl(null);
+    setModelInfo(null);
+    setPlanData(null);
+    setSceneObjects([]);
+    setStatus({ phase: "idle", log: "", progress: 0, done: false, error: null });
+    setIsRunning(false);
+    setFiles(Array.from(e.target.files));
+    fetch(`${API}/api/reset`, { method: "POST" }).catch(() => {});
+  }, []);
   const handleZoneClick = useCallback(() => fileInputRef.current?.click(), []);
 
-  // ── Reference image handling
-  const handleRefDrop = useCallback((e) => {
-    e.preventDefault(); setIsRefDragOver(false);
-    const f = Array.from(e.dataTransfer.files).find((f) => f.type.startsWith("image/"));
-    if (f) { setRefFile(f); setRefPreview(URL.createObjectURL(f)); }
-  }, []);
-  const handleRefDragOver = useCallback((e) => { e.preventDefault(); setIsRefDragOver(true); }, []);
-  const handleRefDragLeave = useCallback(() => setIsRefDragOver(false), []);
-  const handleRefFileChange = useCallback((e) => {
-    const f = e.target.files[0];
-    if (f) { setRefFile(f); setRefPreview(URL.createObjectURL(f)); }
-  }, []);
-  const handleRefZoneClick = useCallback(() => refInputRef.current?.click(), []);
-
-  // ── Compass calibration: "I am currently facing <refDirection>"
-  const handleSetCompass = useCallback(() => {
-    // northOffset = calibrationAzimuth - referenceDirection_angle
-    const offset = azimuthRef.current - DIR_ANGLES[refDirection];
-    setNorthOffset(offset);
-    setCalibrated(true);
-  }, [refDirection]);
-
-  // ── Generate
+  // ── 3D Reconstruction Generate ───────────────────────────────────────
   const handleGenerate = useCallback(async () => {
-    if (!files.length || isRunning) return;
+    if (!files.length) return;
     setIsRunning(true);
+    setStatus({ phase: "starting", log: "Starting reconstruction…", progress: 5, done: false, error: null });
     setLogs([]);
     setModelUrl(null);
-    setCalibrated(false);
+    setModelInfo(null);
+    setPlanData(null);
+    setSceneObjects([]);
 
-    // 1. Upload scene images + reference image + direction
+    // Clear any previous session models and images so different batches don't mix
+    await fetch(`${API}/api/reset`, { method: "POST" }).catch(() => {});
+
     const form = new FormData();
     files.forEach((f) => form.append("images", f));
-    if (refFile) form.append("referenceImage", refFile);
-    form.append("direction", refDirection);
+    form.append("direction", "N");
     try {
       const r = await fetch(`${API}/api/upload`, { method: "POST", body: form });
       if (!r.ok) throw new Error("Upload failed");
     } catch (err) {
       setLogs((p) => [...p, `ERROR: ${err.message}`]);
+      setStatus({ phase: "error", log: err.message, progress: 0, done: false, error: err.message });
       setIsRunning(false);
       return;
     }
 
-    // 2. Start reconstruction
     try {
       await fetch(`${API}/api/reconstruct`, { method: "POST" });
     } catch (err) {
       setLogs((p) => [...p, `ERROR: ${err.message}`]);
+      setStatus({ phase: "error", log: err.message, progress: 0, done: false, error: err.message });
       setIsRunning(false);
     }
-  }, [files, refFile, refDirection, isRunning]);
+  }, [files]);
 
-  // ── Reset
+  // ── Reset ────────────────────────────────────────────────────────────
   const handleReset = useCallback(async () => {
-    setFiles([]); setLogs([]); setModelUrl(null); setRefFile(null);
-    setRefPreview(null); setCalibrated(false);
+    setFiles([]);
+    setLogs([]);
+    setModelUrl(null);
+    setModelInfo(null);
+    setPlanData(null);
+    setSceneObjects([]);
     setStatus({ phase: "idle", log: "", progress: 0, done: false, error: null });
     if (fileInputRef.current) fileInputRef.current.value = "";
-    if (refInputRef.current) refInputRef.current.value = "";
-    await fetch(`${API}/api/reset`, { method: "POST" }).catch(() => { });
+    await fetch(`${API}/api/reset`, { method: "POST" }).catch(() => {});
   }, []);
+
+  const sceneCenter = [0, 0, 0];
+  const sceneRadius = modelInfo?.radius || 2.4;
 
   return (
     <div className="app">
       <Sidebar
-        files={files} isDragOver={isDragOver} fileInputRef={fileInputRef}
-        onDrop={handleDrop} onDragOver={handleDragOver} onDragLeave={handleDragLeave}
-        onFileChange={handleFileChange} onZoneClick={handleZoneClick}
-        refFile={refFile} refPreview={refPreview} refDirection={refDirection}
-        refInputRef={refInputRef}
-        onRefZoneClick={handleRefZoneClick} onRefFileChange={handleRefFileChange}
-        onRefDirChange={setRefDirection}
-        onRefDrop={handleRefDrop} onRefDragOver={handleRefDragOver}
-        onRefDragLeave={handleRefDragLeave} isRefDragOver={isRefDragOver}
-        status={status} logs={logs}
-        onGenerate={handleGenerate} onReset={handleReset} isRunning={isRunning}
+        files={files}
+        isDragOver={isDragOver}
+        fileInputRef={fileInputRef}
+        onDrop={handleDrop}
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onFileChange={handleFileChange}
+        onZoneClick={handleZoneClick}
+        status={status}
+        logs={logs}
+        onGenerate={handleGenerate}
+        onReset={handleReset}
+        isRunning={isRunning}
+        onOpenThreatDetection={() => setActiveTab("threat_detection")}
       />
 
-      {/* ── 3D Viewer */}
-      <main className="viewer-area">
+      {/* ── 3D Viewer & Simulation Canvas ── */}
+      <main className={`viewer-area ${activeTab === "recreation" ? "recreation-mode" : ""} ${activeTab === "threat_detection" ? "threat-mode" : ""}`}>
         <div className="viewer-topbar">
           <div className="viewer-topbar-left">
-            <span className="viewer-tab active">3D View</span>
-            {modelUrl && <span className="viewer-badge">✓ Model ready</span>}
-            {compassCalibrated && (
-              <span className="compass-badge">🧭 Compass calibrated</span>
+            <span
+              className={`viewer-tab ${activeTab === "recreation" ? "active" : ""}`}
+              onClick={() => setActiveTab("recreation")}
+            >
+              🎬 Crime Recreation Studio
+            </span>
+            <span
+              className={`viewer-tab ${activeTab === "3d_scene" ? "active" : ""}`}
+              onClick={() => setActiveTab("3d_scene")}
+            >
+              🏢 3D Photogrammetry Room
+            </span>
+            <span
+              className={`viewer-tab ${activeTab === "threat_detection" ? "active" : ""}`}
+              onClick={() => setActiveTab("threat_detection")}
+            >
+              🔬 Threat & Evidence Analysis
+            </span>
+
+            {activeTab !== "threat_detection" && modelUrl && <span className="viewer-badge">✓ 3D Mesh Active</span>}
+            {activeTab !== "threat_detection" && (
+              <button
+                id="btn-face-direction"
+                className="btn-face-quick"
+                title="Orient 3D view to face North"
+                onClick={() => alignCameraToDirection("N")}
+              >
+                🎯 Face North
+              </button>
             )}
           </div>
+
           <div className="viewer-topbar-right">
-            {modelUrl && !compassCalibrated && refFile && (
-              <button id="btn-set-compass" className="btn-calibrate" onClick={handleSetCompass}>
-                🧭 Set Compass — I&apos;m facing {refDirection}
-              </button>
-            )}
-            {modelUrl && compassCalibrated && (
-              <button id="btn-recalibrate" className="btn-calibrate recalibrate" onClick={() => setCalibrated(false)}>
-                ↻ Recalibrate
-              </button>
-            )}
-            {modelUrl && (
-              <a href={`${API}/models/scene_textured.glb`} download="scene_textured.glb"
-                className="download-link">
+            {modelUrlToLoad && (
+              <a
+                href={modelUrlToLoad}
+                download="scene_textured.glb"
+                className="download-link"
+              >
                 ↓ Download GLB
               </a>
             )}
           </div>
         </div>
 
-        <div className="viewer-canvas">
-          {modelUrl ? (
+        {/* ── Top Section: Crime Recreation Controls appear on TOP ── */}
+        {activeTab === "recreation" && (
+          <div className="recreation-top-container">
+            <RecreationStudio
+              planData={planData}
+              sceneObjects={sceneObjects}
+              onGeneratePlan={handleGenerateRecreationPlan}
+              isPlanning={isPlanning}
+              currentTime={currentTime}
+              onTimeChange={setCurrentTime}
+              isPlaying={isPlaying}
+              onTogglePlay={() => {
+                if (currentTime >= duration) setCurrentTime(0);
+                setIsPlaying(!isPlaying);
+              }}
+              onRestart={() => {
+                setCurrentTime(0);
+                setIsPlaying(true);
+              }}
+              speed={playbackSpeed}
+              onSpeedChange={setPlaybackSpeed}
+              cameraMode={cameraMode}
+              onCameraModeChange={setCameraMode}
+              showRoutes={showRoutes}
+              onToggleRoutes={setShowRoutes}
+              showLabels={showLabels}
+              onToggleLabels={setShowLabels}
+              showAnchors={showAnchors}
+              onToggleAnchors={setShowAnchors}
+              activeCaption={activeCaption}
+              getCanvasElement={() => canvasRef.current || document.querySelector("canvas")}
+              apiKey={geminiApiKey}
+              onApiKeyChange={handleApiKeyChange}
+              onScrollTo3D={() => {
+                document.getElementById("simulation-canvas-section")?.scrollIntoView({ behavior: "smooth" });
+              }}
+            />
+          </div>
+        )}
+
+        {/* Threat Detection & Evidence Analysis Tab */}
+        {activeTab === "threat_detection" && (
+          <div style={{ flex: 1, width: "100%", height: "calc(100% - 49px)", overflowY: "auto", position: "relative", zIndex: 1 }}>
+            <ThreatDetectionTab
+              onSwitchTo3D={() => setActiveTab("3d_scene")}
+              onSwitchToStudio={() => setActiveTab("recreation")}
+            />
+          </div>
+        )}
+
+        {/* ── 3D Model Section: When we scroll, at the bottom we get the 3D model ── */}
+        {activeTab !== "threat_detection" && (
+          <div
+            id="simulation-canvas-section"
+            className={`viewer-canvas ${activeTab === "recreation" ? "recreation-canvas" : ""}`}
+          >
             <Canvas
               key={modelKey}
-              camera={{ position: [0, 1.5, 4], fov: 60, near: 0.01, far: 500 }}
+              camera={{ position: [0, 2.5, 5.5], fov: 55, near: 0.01, far: 500 }}
               style={{ width: "100%", height: "100%" }}
+              gl={{ preserveDrawingBuffer: true, antialias: true }}
             >
-              <ambientLight intensity={1.2} />
-              <directionalLight position={[5, 10, 5]} intensity={2} />
+              <ambientLight intensity={1.3} />
+              <directionalLight position={[6, 12, 6]} intensity={2.2} castShadow />
+              <directionalLight position={[-6, 8, -6]} intensity={0.8} />
+
+              {/* Grid Floor */}
               <Grid
-                position={modelInfo ? [modelInfo.center[0], modelInfo.center[1] - modelInfo.size[1] / 2, modelInfo.center[2]] : [0, -1, 0]}
-                infiniteGrid cellSize={0.5} sectionSize={2}
-                cellColor="#1e2130" sectionColor="#262a3a" fadeDistance={30}
+                position={[sceneCenter[0], -0.01, sceneCenter[2]]}
+                infiniteGrid
+                cellSize={0.5}
+                sectionSize={2}
+                cellColor="#1e2130"
+                sectionColor="#2a3048"
+                fadeDistance={35}
               />
-              <Suspense fallback={null}>
-                <ModelWithCamera url={modelUrl} controlsRef={controlsRef} onModelInfo={setModelInfo} />
-              </Suspense>
+
+              {/* Architectural Grounding Plinth / Forensic Diorama Base */}
+              <group position={[sceneCenter[0], -0.04, sceneCenter[2]]}>
+                <mesh receiveShadow position={[0, -0.02, 0]}>
+                  <cylinderGeometry args={[Math.max(3.8, sceneRadius * 1.35), Math.max(4.0, sceneRadius * 1.4), 0.08, 64]} />
+                  <meshStandardMaterial
+                    color="#141721"
+                    roughness={0.92}
+                    metalness={0.04}
+                  />
+                </mesh>
+                <mesh position={[0, 0.025, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+                  <ringGeometry args={[Math.max(3.7, sceneRadius * 1.32), Math.max(3.75, sceneRadius * 1.35), 64]} />
+                  <meshBasicMaterial color="#38bdf8" opacity={0.3} transparent />
+                </mesh>
+              </group>
+
+              {/* Model if available */}
+              {modelUrlToLoad && (
+                <Suspense fallback={null}>
+                  <ModelWithCamera
+                    url={modelUrlToLoad}
+                    controlsRef={controlsRef}
+                    onModelInfo={setModelInfo}
+                    northOffset={northOffset}
+                  />
+                </Suspense>
+              )}
+
+              {/* Fallback room wireframe and compass if no photogrammetry mesh */}
+              {!modelUrlToLoad && (
+                <ForensicSpatialRoom
+                  center={sceneCenter}
+                  radius={sceneRadius}
+                  northOffset={northOffset}
+                  roomSize={modelInfo?.size}
+                />
+              )}
+
+              {/* Direction markers (both 3D Scene and Recreation Studio tabs) */}
               {compassCalibrated && (
                 <DirectionMarkers
                   northOffset={northOffset}
-                  target={modelInfo?.center || [0, 0, 0]}
-                  radius={modelInfo ? Math.max(modelInfo.size[0], modelInfo.size[2]) * 0.6 : 5}
+                  target={sceneCenter}
+                  radius={sceneRadius}
+                  roomSize={modelInfo?.size}
+                  onSelectDirection={alignCameraToDirection}
                 />
               )}
+
+              {/* In 3D Scene tab: show physical room anchors (doors, chairs, table) when enabled */}
+              {activeTab === "3d_scene" && showAnchors && sceneObjects.length > 0 && (
+                <group>
+                  {sceneObjects.map((obj) => (
+                    <SceneAnchorMarker key={obj.id} name={obj.id} anchor={obj} />
+                  ))}
+                </group>
+              )}
+
+              {/* Forensic Crime Reenactment Simulation with Dummies - in recreation tab */}
+              {activeTab === "recreation" && (planData || sceneObjects.length > 0) && (
+                <ForensicSimulation
+                  plan={planData?.plan}
+                  anchors={planData?.anchors}
+                  physicalObjects={planData?.physicalObjects || sceneObjects}
+                  currentTime={currentTime}
+                  cameraMode={cameraMode}
+                  controlsRef={controlsRef}
+                  showRoutes={showRoutes}
+                  showLabels={showLabels}
+                  showAnchors={showAnchors}
+                  center={sceneCenter}
+                  radius={sceneRadius}
+                />
+              )}
+
+              {/* Simulation Clock & WebGL Canvas Link */}
+              <SimulationClock
+                isPlaying={isPlaying}
+                speed={playbackSpeed}
+                onTick={handleClockTick}
+              />
+              <CanvasCaptureRef canvasRef={canvasRef} />
+
               <OrbitControls
                 ref={controlsRef}
                 makeDefault
@@ -650,36 +1298,27 @@ export default function App() {
               <CameraTracker azimuthRef={azimuthRef} controlsRef={controlsRef} />
               <Environment preset="city" />
             </Canvas>
-          ) : (
-            <div className="viewer-placeholder">
-              <BuildingIcon />
-              <p className="placeholder-text">
-                {isRunning
-                  ? "Reconstruction in progress — model will appear here when ready…"
-                  : 'Upload photos and click "Generate 3D Room" to begin'}
-              </p>
-            </div>
-          )}
 
-          {/* Compass overlay (always visible once model loaded) */}
-          {modelUrl && (
+            {/* Placeholder when in 3D Scene tab without a model */}
+            {activeTab === "3d_scene" && !modelUrl && (
+              <div className="viewer-placeholder" style={{ zIndex: 10 }}>
+                <BuildingIcon />
+                <p className="placeholder-text">
+                  {isRunning
+                    ? "Reconstruction in progress — model will appear here when ready…"
+                    : 'Upload photos and click "Generate 3D Room" to begin, or switch to Crime Recreation tab.'}
+                </p>
+              </div>
+            )}
+
+            {/* Compass overlay */}
             <CompassOverlay
               azimuthRef={azimuthRef}
               northOffset={northOffset}
-              calibrated={compassCalibrated}
-              refImageUrl={refPreview}
-              refDirection={refDirection}
+              onAlignDirection={alignCameraToDirection}
             />
-          )}
-
-          {/* "Set Compass" prompt (when model is ready but not yet calibrated and ref image exists) */}
-          {modelUrl && !compassCalibrated && refFile && (
-            <div className="calibrate-prompt">
-              <span>🧭</span>
-              <span>Orbit to match the reference photo's viewpoint, then click <strong>Set Compass</strong></span>
-            </div>
-          )}
-        </div>
+          </div>
+        )}
       </main>
     </div>
   );
